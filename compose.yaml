@@ -10,12 +10,13 @@ services:
       HOGS_NAME: "${HOGS_NAME:-Hogs of War lobby}"
       HOGS_MAX_CLIENTS: "${HOGS_MAX_CLIENTS:-200}"
       HOGS_MAX_PER_IP: "${HOGS_MAX_PER_IP:-16}"
+      HOGS_FRONT_SECRET: "${HOGS_FRONT_SECRET:-}"
     read_only: true
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
-    mem_limit: 128m
+    mem_limit: 256m
     pids_limit: 64
     logging:
       driver: json-file

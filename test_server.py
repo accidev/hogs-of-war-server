@@ -5,7 +5,9 @@ Each test starts a server on a free local port and talks to it as game clients w
 import asyncio
 import struct
 import time
+import types
 import unittest
+from unittest import mock
 
 import hogs_server as hs
 from hogs_server import Fields, blob16, frame, str8
@@ -14,8 +16,10 @@ from hogs_server import Fields, blob16, frame, str8
 class Peer:
     """A game client."""
 
-    async def connect(self, port, compat=7, protocol=hs.PROTOCOL, magic=hs.MAGIC, hello=True):
+    async def connect(self, port, compat=7, protocol=hs.PROTOCOL, magic=hs.MAGIC, hello=True, front=None):
         self.reader, self.writer = await asyncio.open_connection('127.0.0.1', port)
+        if front:
+            self.send(hs.FRONT, str8(front[0]) + str8(front[1]))
         if hello:
             self.send(hs.HELLO, magic + struct.pack('<HI', protocol, compat))
             kind, f = await self.recv()
@@ -76,7 +80,7 @@ class Peer:
 
 class ServerTest(unittest.IsolatedAsyncioTestCase):
     async def start(self, **settings):
-        self.server = hs.Server(**settings)
+        self.server = hs.Server(**{'free_loopback': False, **settings})  # every peer of a test is a local one
         self.listener = await asyncio.start_server(self.server.serve, '127.0.0.1', 0)
         self.port = self.listener.sockets[0].getsockname()[1]
 
@@ -87,7 +91,7 @@ class ServerTest(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         for peer in self.peers:
             peer.writer.close()
-        self.server.close()
+        await self.server.close()
         self.listener.close()
 
     async def peer(self, **how):
@@ -264,6 +268,187 @@ class ServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await peer.error(), (0, hs.E_BAD))
         await self.settled()
         self.assertEqual(self.server.rooms, {})
+
+    async def test_rate_limit_ends_the_connection(self):
+        self.listener.close()
+        await self.start(max_delay=0.5)
+        a = await self.peer()
+        a.writer.write(frame(hs.PING) * 600)  # the last of them would wait 3 s
+        pongs = 0
+        kind, f = await a.recv()
+        while kind == hs.PONG:
+            pongs += 1
+            kind, f = await a.recv()
+        self.assertEqual((kind, f.u8(), f.u8()), (hs.ERROR, 0, hs.E_RATE))
+        self.assertEqual(await a.recv(), (None, None))
+        self.assertTrue(hs.BURST - 5 < pongs < hs.BURST + 150, pongs)  # the frames up to the bound were answered
+
+    async def test_throttle_keeps_order(self):
+        count = 560
+        with mock.patch.object(hs, 'RATE', 200), self.assertLogs('hogs', 'INFO') as logs:
+            host, *senders = [await self.peer() for _ in range(4)]
+            room = await host.create()
+            for sender in senders:
+                await sender.join(room['id'])
+            for _ in senders:
+                await host.expect(hs.PLAYER_JOINED)
+            started = time.monotonic()
+            for number, sender in enumerate(senders):  # each one is held back after its first 300 frames
+                sender.writer.write(b''.join(frame(hs.SEND, struct.pack('<IBI', host.id, number, i))
+                                             for i in range(count)))
+            got = [[] for _ in senders]
+            for _ in range(count * len(senders)):
+                f = await host.expect(hs.DATA)
+                sender, to, (number, i) = f.u32(), f.u32(), struct.unpack('<BI', f.rest())
+                self.assertEqual((sender, to), (senders[number].id, host.id))
+                got[number].append(i)
+            self.assertEqual(got, [list(range(count))] * len(senders))
+            self.assertGreater(time.monotonic() - started, (count - hs.BURST) / hs.RATE * 0.9)
+        self.assertEqual(len([line for line in logs.output if 'for the rate limit' in line]), len(senders))
+
+    async def test_list_costs_more(self):
+        with mock.patch.object(hs, 'RATE', 1000):
+            a = await self.peer()
+            started = time.monotonic()
+            a.writer.write(frame(hs.LIST) * 25)  # the first 14 are free, the others are held back
+            for _ in range(25):
+                await a.expect(hs.ROOMS)
+            self.assertGreater(time.monotonic() - started, 0.15)
+
+    async def test_disconnect_is_logged(self):
+        self.listener.close()
+        await self.start(hello_seconds=0.2)
+        with self.assertLogs('hogs', 'INFO') as logs:
+            quiet, gone, bad = await self.peer(hello=False), await self.peer(), await self.peer()
+            gone.writer.close()
+            bad.send(hs.CREATE, bytes([0, 0]) + str8(b'x') + blob16(b'') + str8(b'p'))
+            await bad.recv()
+            self.assertEqual(await quiet.recv(), (None, None))
+            await self.settled()
+        text = '\n'.join(logs.output)
+        for ident, cause in ((r'\d+', 'idle timeout'), (gone.id, 'the peer closed'),
+                             (bad.id, 'bad frame: bad player limit')):
+            self.assertRegex(text, r'127\.0\.0\.1 #%s gone: %s; \d+ s, \d+ frames, worst delay \d\.\d\d s'
+                             % (ident, cause))
+
+    async def test_set_room_below_the_players(self):
+        a, b, c = [await self.peer() for _ in range(3)]
+        room = await a.create(limit=4)
+        await b.join(room['id'])
+        await c.join(room['id'])
+        for peer, joins in (a, 2), (b, 1):
+            for _ in range(joins):
+                await peer.expect(hs.PLAYER_JOINED)
+        a.send(hs.SET_ROOM, bytes([0, 1]) + blob16(b'd'))
+        self.assertEqual((await a.expect(hs.OK)).u8(), hs.SET_ROOM)
+        for peer in b, c:
+            f = await peer.expect(hs.ROOM_CHANGED)
+            self.assertEqual((f.u8(), f.u8()), (0, 3))
+        self.assertEqual((await a.rooms())[0][0]['limit'], 3)
+        for limit in 0, hs.MAX_PLAYERS + 1:  # these are still bad frames
+            host = await self.peer()
+            await host.create()
+            host.send(hs.SET_ROOM, bytes([0, limit]) + blob16(b''))
+            self.assertEqual(await host.error(), (0, hs.E_BAD))
+            self.assertEqual(await host.recv(), (None, None))
+
+    def test_patience(self):
+        def patience(server, room, period):
+            return server.patience(types.SimpleNamespace(compat=1, room=room, period=period))
+
+        server = hs.Server()
+        self.assertEqual([patience(server, True, p) for p in (0, 1, 5, 30)], [90, 10, 15, 90])
+        self.assertEqual([patience(server, False, p) for p in (1, 30)], [90, 90])
+        self.assertEqual(patience(hs.Server(idle_seconds=20), True, 30), 20)  # never later than the normal limit
+
+    async def test_ping_period(self):
+        self.listener.close()
+        await self.start(idle_seconds=60, min_idle_seconds=0.1)  # a period of 1 second gives 3 seconds in a room
+        told, left, silent, ignored = [await self.peer() for _ in range(4)]
+        for peer in told, left, silent, ignored:
+            await peer.create()
+        left.send(hs.LEAVE)
+        await left.expect(hs.OK)
+        for peer, period in (told, 1), (left, 1), (silent, None), (ignored, 0), (ignored, 31):
+            peer.send(hs.PING, bytes(4) + (bytes([period]) if period is not None else b''))
+            self.assertEqual(len((await peer.expect(hs.PONG)).rest()), 4 + (period is not None))  # the echo is whole
+        started = time.monotonic()
+        self.assertEqual(await asyncio.wait_for(told.reader.read(), 6), b'')
+        self.assertTrue(2.5 < time.monotonic() - started < 4.5)
+        for peer in left, silent, ignored:  # no room, no period told, a period that is none: all still here
+            peer.send(hs.PING, b'x')
+            self.assertEqual((await peer.expect(hs.PONG)).rest(), b'x')
+
+    async def test_front(self):
+        self.listener.close()
+        await self.start(front_secret='s3cret')
+        a = await self.peer(front=(b's3cret', b'203.0.113.7'))
+        self.assertEqual(a.first[0], hs.WELCOME)
+        self.assertEqual([client.ip for client in self.server.clients], ['203.0.113.7'])
+
+    async def test_front_refused(self):
+        self.listener.close()
+        await self.start(front_secret='s3cret')
+        with self.assertLogs('hogs', 'INFO') as logs:
+            for how in {'front': (b'wrong', b'203.0.113.7')}, {'front': (b'', b'203.0.113.7')}, {}:
+                self.assertEqual((await self.peer(**how)).first, (None, None))  # closed, nothing was said
+            short = await self.peer(hello=False)
+            short.send(hs.FRONT)
+            self.assertEqual(await short.recv(), (None, None))
+            twice = await self.peer(hello=False)
+            twice.send(hs.FRONT, str8(b's3cret') + str8(b'1.2.3.4'))
+            twice.send(hs.FRONT, str8(b's3cret') + str8(b'1.2.3.4'))  # this one is no use after the first
+            self.assertEqual(await twice.error(), (0, hs.E_BAD))
+            await self.settled()
+        text = '\n'.join(logs.output)
+        self.assertIn('wrong front secret', text)
+        self.assertIn('FRONT must come first', text)
+        self.assertEqual(self.server.per_ip, {})
+
+    async def test_front_is_a_bad_frame_without_a_secret(self):
+        a = await self.peer(hello=False)
+        a.send(hs.FRONT, str8(b'x') + str8(b'1.2.3.4'))
+        self.assertEqual(await a.error(), (0, hs.E_BAD))
+        b = await self.peer()
+        b.send(hs.FRONT, str8(b'x') + str8(b'1.2.3.4'))
+        self.assertEqual(await b.error(), (0, hs.E_BAD))
+
+    async def test_limits_count_the_front_address(self):
+        self.listener.close()
+        await self.start(front_secret='k', max_per_ip=2)
+        here, there = (b'k', b'198.51.100.1'), (b'k', b'198.51.100.2')
+        a, b, c = await self.peer(front=here), await self.peer(front=here), await self.peer(front=there)
+        refused = await self.peer(front=here, hello=False)
+        self.assertEqual(await refused.error(), (0, hs.E_BUSY))
+        self.assertEqual(await refused.recv(), (None, None))
+        self.assertEqual(self.server.per_ip, {'198.51.100.1': 2, '198.51.100.2': 1})  # not the address of the peer
+        a.writer.close()
+        await self.settled()
+        self.assertEqual(self.server.per_ip, {'198.51.100.1': 1, '198.51.100.2': 1})
+        self.assertEqual((await self.peer(front=here)).first[0], hs.WELCOME)
+
+    async def test_loopback_is_exempt(self):
+        self.listener.close()
+        await self.start(front_secret='k', max_clients=1, max_per_ip=1, free_loopback=True)
+        for _ in range(3):
+            self.assertEqual((await self.peer()).first[0], hs.WELCOME)  # no FRONT, no limit
+        self.assertEqual(self.server.per_ip, {})
+        self.assertEqual((await self.peer(front=(b'k', b'198.51.100.1'))).first[0], hs.WELCOME)  # it may send one
+        self.assertEqual(self.server.per_ip, {'198.51.100.1': 1})  # and then it is counted by that address
+        self.assertEqual((await self.peer(front=(b'x', b'198.51.100.1'))).first, (None, None))  # a wrong one is refused
+        self.listener.close()
+        await self.start(front_secret='k', max_clients=1, free_loopback=False)  # the total is checked on accept
+        self.assertEqual((await self.peer(front=(b'k', b'198.51.100.1'))).first[0], hs.WELCOME)
+        self.assertEqual(await (await self.peer(hello=False)).error(), (0, hs.E_BUSY))
+
+    async def test_restart_notice(self):
+        a, b, late = await self.peer(), await self.peer(), await self.peer(hello=False)
+        await a.create()
+        await self.server.close()
+        for peer in a, b, late:
+            f = await peer.expect(hs.ERROR)
+            self.assertEqual((f.u8(), f.u8(), f.str8()), (0, hs.E_BUSY, b'the server restarts'))
+            self.assertEqual(await peer.recv(), (None, None))
 
 
 if __name__ == '__main__':

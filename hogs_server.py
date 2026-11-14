@@ -8,6 +8,8 @@ The wire format is in PROTOCOL.md.
     python hogs_server.py        settings come from the environment, see README.md
 """
 import asyncio
+import collections
+import hmac
 import logging
 import os
 import signal
@@ -26,10 +28,14 @@ HELLO_SECONDS = 10  # a new connection must send HELLO this soon
 IDLE_SECONDS = 90   # a client that sends nothing this long is gone
 RATE = 100          # frames per second from one client, sustained
 BURST = 300
+LIST_COST = 20      # one LIST counts as this many frames against RATE
+MAX_DELAY = 5       # seconds a frame may wait for the rate limit; a client that needs longer is dropped
+MIN_IDLE_SECONDS = 10  # the shortest silence that drops a client in a room that has told its ping period
+LOOPBACK = ('127.0.0.1', '::1')
 MAX_UNSENT = 256 * 1024  # a client that does not read is dropped at this many buffered bytes
 
 # client -> server
-HELLO, LIST, CREATE, JOIN, LEAVE, SEND, SET_ROOM, SET_PLAYER, PING = range(1, 10)
+HELLO, LIST, CREATE, JOIN, LEAVE, SEND, SET_ROOM, SET_PLAYER, PING, FRONT = range(1, 11)
 # server -> client
 (WELCOME, ROOMS, JOINED, PLAYER_JOINED, PLAYER_LEFT, DATA, ROOM_CHANGED, PLAYER_DATA, OK, ERROR,
  PONG) = range(0x81, 0x8C)
@@ -106,23 +112,47 @@ class Fields:
 
 
 class Client:
-    def __init__(self, ident, writer, ip):
+    def __init__(self, ident, reader, writer, ip, fronted):
         self.id = ident  # also the player id in a room
         self.writer = writer
-        self.ip = ip
+        self.ip = ip  # the peer's, or the one a front gave
+        self.fronted = fronted  # FRONT is not needed or has come: only now the client gets answers
+        self.counted = None  # the address this connection is counted under in per_ip
         self.compat = None  # set by HELLO
         self.room = None
         self.name = b''
         self.data = b''
+        self.period = 0  # seconds between its pings, if it said so (PING)
+        self.cause = None  # why the server ends the connection, when the stream alone does not say
         self.tokens = float(BURST)
-        self.stamp = time.monotonic()
+        self.stamp = self.since = time.monotonic()
+        self.frames = 0
+        self.worst = 0.0  # the longest a frame of this client waited for the rate limit
+        self.noted = float('-inf')  # when that was last logged
+        # The stream does not tell when bytes came, and a frame can lie in its buffer for seconds.
+        self.arrivals = collections.deque()  # (time, bytes received so far) for every piece the stream got
+        self.received = self.used = 0
+        feed = reader.feed_data
 
-    def delay(self):
-        """One frame against the rate limit (a token bucket): the seconds to hold it back, 0 mostly."""
+        def stamped(data):
+            self.received += len(data)
+            self.arrivals.append((time.monotonic(), self.received))
+            feed(data)
+        reader.feed_data = stamped
+
+    def delay(self, cost):
+        """Frames against the rate limit (a token bucket): the seconds to hold them back, 0 mostly."""
         now = time.monotonic()
-        self.tokens = min(BURST, self.tokens + (now - self.stamp) * RATE) - 1
+        self.tokens = min(BURST, self.tokens + (now - self.stamp) * RATE) - cost
         self.stamp = now
         return -self.tokens / RATE if self.tokens < 0 else 0
+
+    def waited(self, count):
+        """Seconds the last of the `count` bytes just read lay in the buffer."""
+        self.used += count
+        while self.arrivals and self.arrivals[0][1] < self.used:
+            self.arrivals.popleft()
+        return time.monotonic() - self.arrivals[0][0] if self.arrivals else 0
 
 
 class Room:
@@ -138,13 +168,20 @@ class Room:
 
 class Server:
     def __init__(self, name='Hogs of War lobby', max_clients=200, max_per_ip=16, max_rooms=100,
-                 hello_seconds=HELLO_SECONDS, idle_seconds=IDLE_SECONDS):
+                 hello_seconds=HELLO_SECONDS, idle_seconds=IDLE_SECONDS, min_idle_seconds=MIN_IDLE_SECONDS,
+                 max_delay=MAX_DELAY, front_secret='', free_loopback=True):
         self.name = name.encode('ascii', 'replace')[:MAX_NAME]
         self.max_clients = max_clients
         self.max_per_ip = max_per_ip  # 0: no limit
         self.max_rooms = max_rooms
         self.hello_seconds = hello_seconds
         self.idle_seconds = idle_seconds
+        self.min_idle_seconds = min_idle_seconds
+        self.max_delay = max_delay
+        self.secret = front_secret.encode()  # empty: connections need no FRONT
+        if len(self.secret) > MAX_NAME:
+            raise ValueError('the front secret is longer than %d bytes' % MAX_NAME)
+        self.free_loopback = free_loopback  # local peers need no FRONT and are not limited in number
         self.clients = set()
         self.per_ip = {}
         self.rooms = {}
@@ -158,59 +195,103 @@ class Server:
 
     async def serve(self, reader, writer):
         ip = (writer.get_extra_info('peername') or ('?',))[0]
-        if len(self.clients) >= self.max_clients or (self.max_per_ip and self.per_ip.get(ip, 0) >= self.max_per_ip):
+        free = self.free_loopback and ip in LOOPBACK
+        if len(self.clients) >= self.max_clients and not free:
             log.info('%s refused: too many connections', ip)
             writer.write(frame(ERROR, bytes([0, E_BUSY]) + str8(b'server is full')))
             writer.close()
             return
-        client = Client(self.next_client, writer, ip)
+        client = Client(self.next_client, reader, writer, ip, free or not self.secret)
         self.next_client += 1
         self.clients.add(client)
-        self.per_ip[ip] = self.per_ip.get(ip, 0) + 1
+        cause = 'stopped'
         try:
+            if client.fronted and not free:  # with a secret the address is final only after FRONT
+                self.admit(client)
             await self.talk(client, reader)
         except Bad as why:
-            log.info('%s #%d dropped: %s', ip, client.id, why)
-            self.error(client, 0, E_BAD, str(why))
-        except (Close, asyncio.TimeoutError, asyncio.IncompleteReadError, OSError):
-            pass
+            cause = 'bad frame: %s' % why
+            if client.fronted:  # a peer that has not proved it is the front gets no answer
+                self.error(client, 0, E_BAD, str(why))
+        except Close as why:
+            cause = 'closed by the server: %s' % why
+        except asyncio.TimeoutError:
+            cause = 'idle timeout'
+        except asyncio.IncompleteReadError:
+            cause = client.cause or 'the peer closed'
+        except (ConnectionResetError, ConnectionAbortedError):
+            cause = 'connection reset'
+        except OSError as why:
+            cause = 'network error: %s' % why
         finally:
+            log.info('%s #%d gone: %s; %.0f s, %d frames, worst delay %.2f s', client.ip, client.id, cause,
+                     time.monotonic() - client.since, client.frames, client.worst)
             self.leave(client)
             self.clients.discard(client)
-            self.per_ip[ip] -= 1
-            if not self.per_ip[ip]:
-                del self.per_ip[ip]
+            if client.counted:
+                self.per_ip[client.counted] -= 1
+                if not self.per_ip[client.counted]:
+                    del self.per_ip[client.counted]
             writer.close()
 
+    def admit(self, client):
+        """Counts the connection against the limit for its address."""
+        count = self.per_ip.get(client.ip, 0)
+        if self.max_per_ip and count >= self.max_per_ip:
+            self.error(client, 0, E_BUSY, 'server is full')
+            raise Close('too many connections from this address')
+        self.per_ip[client.ip] = count + 1
+        client.counted = client.ip
+
+    def patience(self, client):
+        """Seconds of silence after which the client is gone."""
+        if client.compat is None:
+            return self.hello_seconds
+        if client.room and client.period:
+            return min(self.idle_seconds, max(self.min_idle_seconds, 3 * client.period))
+        return self.idle_seconds
+
     async def talk(self, client, reader):
-        wait = self.hello_seconds
         while True:
-            (size,) = struct.unpack('<H', await asyncio.wait_for(reader.readexactly(2), wait))
+            (size,) = struct.unpack('<H', await asyncio.wait_for(reader.readexactly(2), self.patience(client)))
             if not 1 <= size <= MAX_FRAME:
                 raise Bad('bad frame size')
             body = await asyncio.wait_for(reader.readexactly(size), self.hello_seconds)
+            client.frames += 1
             # Too many frames are not a reason to end a game: a game that was stopped for a while
             # sends all its ticks at once. They are read no faster than RATE, and the sender waits.
-            late = client.delay()
-            if late:
-                await asyncio.sleep(late)
+            kind = body[0]
+            hold = client.delay(LIST_COST if kind == LIST else 1)
+            late = client.waited(2 + size) + hold
+            client.worst = max(client.worst, late)
+            if late > self.max_delay:
+                self.error(client, 0, E_RATE, 'too many frames')
+                raise Close('a frame would wait %.1f s for the rate limit' % late)
+            if late > 1 and time.monotonic() - client.noted >= 10:
+                client.noted = time.monotonic()
+                log.info('%s #%d: frames wait %.1f s for the rate limit', client.ip, client.id, late)
+            if hold:
+                await asyncio.sleep(hold)
             fields = Fields(body[1:])
-            if client.compat is None:
-                if body[0] != HELLO:
+            if kind == FRONT and self.secret and client.frames == 1:  # a local peer may send it too
+                self.on_front(client, fields)
+            elif not client.fronted:
+                raise Close('FRONT must come first')
+            elif client.compat is None:
+                if kind != HELLO:
                     raise Bad('HELLO must come first')
                 self.on_hello(client, fields)
-            elif body[0] in self.handlers:
-                self.handlers[body[0]](client, fields)
+            elif kind in self.handlers:
+                self.handlers[kind](client, fields)
             else:
-                raise Bad('unknown frame type %d' % body[0])
-            wait = self.idle_seconds
+                raise Bad('unknown frame type %d' % kind)
 
     def send(self, client, data):
         transport = client.writer.transport
         if transport.is_closing():
             return
         if transport.get_write_buffer_size() > MAX_UNSENT:
-            log.info('%s #%d dropped: does not read', client.ip, client.id)
+            client.cause = 'does not read'
             transport.abort()  # its reader fails next, and serve() cleans up
             return
         client.writer.write(data)
@@ -236,11 +317,30 @@ class Server:
         for player in room.players:
             self.send(player, frame(PLAYER_LEFT, struct.pack('<II', client.id, room.players[0].id)))
 
-    def close(self):
-        for client in list(self.clients):
-            client.writer.transport.abort()
+    async def close(self):
+        """The server stops: every client is told, and has a second to receive it before the rest is cut."""
+        clients = list(self.clients)
+        for client in clients:
+            client.cause = 'the server restarts'
+            self.error(client, 0, E_BUSY, 'the server restarts')
+            client.writer.close()
+        try:
+            closed = asyncio.gather(*(c.writer.wait_closed() for c in clients), return_exceptions=True)
+            await asyncio.wait_for(closed, 1)
+        except asyncio.TimeoutError:
+            for client in clients:
+                client.writer.transport.abort()
 
     # requests
+
+    def on_front(self, client, f):
+        secret, address = f.str8(), f.str8()
+        f.end()
+        if not hmac.compare_digest(secret, self.secret):
+            raise Close('wrong front secret')
+        client.fronted = True
+        client.ip = address.decode('ascii', 'replace') or client.ip
+        self.admit(client)
 
     def on_hello(self, client, f):
         magic, protocol, compat = f.take(4), f.u16(), f.u32()
@@ -249,7 +349,7 @@ class Server:
             raise Bad('not a Hogs of War client')
         if protocol != PROTOCOL:
             self.error(client, HELLO, E_VERSION, 'this server speaks protocol %d' % PROTOCOL)
-            raise Close
+            raise Close('protocol %d' % protocol)
         client.compat = compat
         self.send(client, frame(WELCOME, struct.pack('<HIHH', PROTOCOL, client.id, MAX_FRAME, self.idle_seconds)
                                 + str8(self.name)))
@@ -336,8 +436,9 @@ class Server:
             return self.error(client, SET_ROOM, E_STATE, 'not in a room')
         if room.players[0] is not client:
             return self.error(client, SET_ROOM, E_NOT_HOST, 'only the host changes the room')
-        if not len(room.players) <= limit <= MAX_PLAYERS:
+        if not 1 <= limit <= MAX_PLAYERS:
             raise Bad('bad player limit')
+        limit = max(limit, len(room.players))  # a host who sets it below the players does not drop out
         room.flags, room.limit, room.desc = flags, limit, desc
         for other in self.others(client):
             self.send(other, frame(ROOM_CHANGED, bytes([flags, limit]) + blob16(desc)))
@@ -357,6 +458,8 @@ class Server:
         echo = f.rest()
         if len(echo) > 16:
             raise Bad('ping too long')
+        if len(echo) >= 5 and 1 <= echo[4] <= 30:
+            client.period = echo[4]
         self.send(client, frame(PONG, echo))
 
 
@@ -365,7 +468,8 @@ async def main():
     port = int(os.environ.get('HOGS_PORT', PORT))
     server = Server(name=os.environ.get('HOGS_NAME', 'Hogs of War lobby'),
                     max_clients=int(os.environ.get('HOGS_MAX_CLIENTS', 200)),
-                    max_per_ip=int(os.environ.get('HOGS_MAX_PER_IP', 16)))
+                    max_per_ip=int(os.environ.get('HOGS_MAX_PER_IP', 16)),
+                    front_secret=os.environ.get('HOGS_FRONT_SECRET', ''))
     listener = await asyncio.start_server(server.serve, None, port)
     stop = asyncio.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -373,10 +477,12 @@ async def main():
             asyncio.get_running_loop().add_signal_handler(sig, stop.set)
         except NotImplementedError:  # Windows: Ctrl+C raises KeyboardInterrupt instead
             pass
-    log.info('listening on port %d, protocol %d', port, PROTOCOL)
+    log.info('listening on port %d, protocol %d%s', port, PROTOCOL, ', only through a front' if server.secret else '')
     async with listener:
-        await stop.wait()
-        server.close()  # leaving the block waits for every connection to end
+        try:
+            await stop.wait()
+        finally:  # Ctrl+C on Windows cancels this task instead of setting stop
+            await server.close()  # leaving the block waits for every connection to end
     log.info('stopped')
 
 

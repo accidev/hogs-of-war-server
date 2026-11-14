@@ -14,6 +14,8 @@ A frame is:
 | type | u8 | below |
 | fields | length − 1 | |
 
+The body of a frame (the `length` bytes) must arrive within 10 seconds of its length field.
+
 Field kinds: `u8`, `u16`, `u32`; `str8` is a u8 length and that many bytes (at most 63); `blob16` is a u16 length and that many bytes (at most 1024); `bytes` is everything up to the end of the frame.
 
 Names, descriptions, player data and messages are opaque bytes: the server stores them or passes them on and never looks inside. Text in `ERROR` and the server name are ASCII.
@@ -22,7 +24,7 @@ Names, descriptions, player data and messages are opaque bytes: the server store
 
 A front can stand before the server and take WebSocket connections from the clients: `cloudflare/worker.js` is one, for Cloudflare Workers. The client then connects to `wss://<name of the front>` and the players do not see the server's address. The bytes are the same: the client sends each frame as one binary message, the front writes the bytes of a message to a TCP connection to the server, and what the server sends comes back as binary messages cut anywhere. So a client reads the messages as one stream of bytes and finds the frames by their length field; the borders of the messages mean nothing.
 
-Behind a front the server sees the address of the front for every client: its limit of connections per address then counts all players together.
+Behind a front the server sees the address of the front for every client: its limit of connections per address then counts all players together. A front can tell the real address with FRONT, and the server can be set to accept connections from a front only: see FRONT below.
 
 ## Client to server
 
@@ -37,12 +39,16 @@ Behind a front the server sees the address of the front for every client: its li
 | 0x07 | SET_ROOM | u8 flags, u8 max players, blob16 description | OK |
 | 0x08 | SET_PLAYER | blob16 data | OK |
 | 0x09 | PING | bytes (at most 16) | PONG with the same bytes |
+| 0x0A | FRONT | str8 secret, str8 address | none |
 
-- HELLO must be the first frame and must arrive within 10 seconds.
+- HELLO must be the first frame (after FRONT, when the server asks for it) and must arrive within 10 seconds.
 - `compat` is a number the client makes up from everything that must be equal for two games to stay in step: the version of the fix and the settings that change the battle. A room has the compat of its creator, and only clients with the same number can join it.
 - `to` in SEND is a player id, or 0 for every other player of the room. A message to a player who has left goes nowhere, without an error.
-- SET_ROOM is for the host. Flag bit 0 (`CLOSED`) stops new players from joining; the room stays in the list with the flag. Max players is 1 to 8 and not less than the players in the room.
+- SET_ROOM is for the host. Flag bit 0 (`CLOSED`) stops new players from joining; the room stays in the list with the flag. Max players is 1 to 8; a number below the players in the room is raised to their number, and ROOM_CHANGED carries the raised one. Another number is a bad frame.
 - After 90 seconds without any frame from a client the server closes the connection: send PING when there is nothing else to send. WELCOME tells the number of seconds.
+- A client can have a vanished connection noticed sooner. When the payload of PING is at least 5 bytes, byte 5 (the fifth) is the number of seconds between the client's pings, 1 to 30; any other value is ignored. While such a client is in a room, the server closes the connection after `max(10, 3 × that number)` seconds without any frame from it, and never later than the 90 seconds. Outside a room, and for a client that has not sent the byte, only the 90 seconds count. The answer is the same as for any PING.
+- A LIST counts as 20 frames against the rate limit, see Errors.
+- FRONT is for a front only. When the server is set with a secret, the first frame of every connection must be FRONT with exactly that secret, or the server closes the connection and says nothing. The address is the client's: the server takes it for the address of that connection from then on, for its limit of connections per address and its log (an empty address leaves the address of the front). HELLO must follow within 10 seconds. A connection from the machine of the server itself (`127.0.0.1`, `::1`) needs no FRONT, and is not counted in the limits on connections. Without a secret FRONT is a bad frame, like any frame that is not HELLO before HELLO.
 
 ## Server to client
 
@@ -79,10 +85,12 @@ Behind a front the server sees the address of the front for every client: its li
 | 6 | COMPAT | JOIN: the room has another compat | stays |
 | 7 | STATE | a request that needs a room without one, or CREATE and JOIN inside a room | stays |
 | 8 | NOT_HOST | SET_ROOM from a player who is not the host | stays |
-| 9 | BUSY | too many connections (in all, or from one address), or too many rooms | closed, except for CREATE |
-| 10 | RATE | not sent any more, see below | |
+| 9 | BUSY | too many connections (in all, or from one address), or too many rooms; the server restarts | closed, except for CREATE |
+| 10 | RATE | a frame would wait more than 5 seconds for the rate limit | closed |
 
-The server reads a client's frames no faster than 100 a second, after 300 at once. More than that is not an error: the frames wait in the connection and the client's sending slows down.
+The server reads a client's frames no faster than 100 a second, after 300 at once; a LIST counts as 20 frames. More than that is not an error: the frames wait in the connection, in their order, and the client's sending slows down. When a frame would have to wait more than 5 seconds (counted from when it came), the server sends ERROR with request 0 and the code RATE and closes the connection.
+
+When the server stops, it sends every client ERROR with request 0, the code BUSY and the text `the server restarts`, and closes the connections about a second later. The rooms are gone with it.
 
 A client that does not read what it is sent is dropped when 256 KB wait for it.
 
