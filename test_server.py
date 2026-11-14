@@ -4,6 +4,7 @@ Each test starts a server on a free local port and talks to it as game clients w
 """
 import asyncio
 import struct
+import time
 import unittest
 
 import hogs_server as hs
@@ -237,15 +238,13 @@ class ServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await a.error(), (0, hs.E_BAD))
         self.assertEqual(await a.recv(), (None, None))
 
-        b.writer.write(frame(hs.PING) * (hs.BURST + 100))
-        seen = []
-        while True:
-            kind, f = await b.recv()
-            if kind is None:
-                break
-            seen.append(kind)
-        self.assertEqual(seen[-1], hs.ERROR)
-        self.assertLess(len(seen), hs.BURST + 50)
+        # more frames than the rate allows are all answered, the last ones later
+        started = time.monotonic()
+        b.writer.write(frame(hs.PING) * (hs.BURST + 50))
+        for _ in range(hs.BURST + 50):
+            self.assertEqual((await b.recv())[0], hs.PONG)
+        self.assertGreater(time.monotonic() - started, 40 / hs.RATE)
+        b.writer.close()
         await self.settled()
         self.assertEqual(self.server.per_ip, {})
 

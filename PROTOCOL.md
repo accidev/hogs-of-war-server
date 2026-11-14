@@ -18,6 +18,12 @@ Field kinds: `u8`, `u16`, `u32`; `str8` is a u8 length and that many bytes (at m
 
 Names, descriptions, player data and messages are opaque bytes: the server stores them or passes them on and never looks inside. Text in `ERROR` and the server name are ASCII.
 
+### Through a WebSocket
+
+A front can stand before the server and take WebSocket connections from the clients: `cloudflare/worker.js` is one, for Cloudflare Workers. The client then connects to `wss://<name of the front>` and the players do not see the server's address. The bytes are the same: the client sends each frame as one binary message, the front writes the bytes of a message to a TCP connection to the server, and what the server sends comes back as binary messages cut anywhere. So a client reads the messages as one stream of bytes and finds the frames by their length field; the borders of the messages mean nothing.
+
+Behind a front the server sees the address of the front for every client: its limit of connections per address then counts all players together.
+
 ## Client to server
 
 | Type | Name | Fields | Answer |
@@ -74,7 +80,9 @@ Names, descriptions, player data and messages are opaque bytes: the server store
 | 7 | STATE | a request that needs a room without one, or CREATE and JOIN inside a room | stays |
 | 8 | NOT_HOST | SET_ROOM from a player who is not the host | stays |
 | 9 | BUSY | too many connections (in all, or from one address), or too many rooms | closed, except for CREATE |
-| 10 | RATE | more than 100 frames a second for a while (300 at once are allowed) | closed |
+| 10 | RATE | not sent any more, see below | |
+
+The server reads a client's frames no faster than 100 a second, after 300 at once. More than that is not an error: the frames wait in the connection and the client's sending slows down.
 
 A client that does not read what it is sent is dropped when 256 KB wait for it.
 

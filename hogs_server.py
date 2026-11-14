@@ -117,15 +117,12 @@ class Client:
         self.tokens = float(BURST)
         self.stamp = time.monotonic()
 
-    def allow(self):
-        """One frame against the rate limit (a token bucket)."""
+    def delay(self):
+        """One frame against the rate limit (a token bucket): the seconds to hold it back, 0 mostly."""
         now = time.monotonic()
-        self.tokens = min(BURST, self.tokens + (now - self.stamp) * RATE)
+        self.tokens = min(BURST, self.tokens + (now - self.stamp) * RATE) - 1
         self.stamp = now
-        if self.tokens < 1:
-            return False
-        self.tokens -= 1
-        return True
+        return -self.tokens / RATE if self.tokens < 0 else 0
 
 
 class Room:
@@ -192,10 +189,11 @@ class Server:
             if not 1 <= size <= MAX_FRAME:
                 raise Bad('bad frame size')
             body = await asyncio.wait_for(reader.readexactly(size), self.hello_seconds)
-            if not client.allow():
-                log.info('%s #%d dropped: too many frames', client.ip, client.id)
-                self.error(client, body[0], E_RATE, 'too many frames')
-                raise Close
+            # Too many frames are not a reason to end a game: a game that was stopped for a while
+            # sends all its ticks at once. They are read no faster than RATE, and the sender waits.
+            late = client.delay()
+            if late:
+                await asyncio.sleep(late)
             fields = Fields(body[1:])
             if client.compat is None:
                 if body[0] != HELLO:
