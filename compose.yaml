@@ -1,0 +1,24 @@
+# docker compose up -d --build
+# Settings: a file named .env next to this one, see README.md.
+services:
+  lobby:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${HOGS_PORT:-47800}:47800"
+    environment:
+      HOGS_NAME: "${HOGS_NAME:-Hogs of War lobby}"
+      HOGS_MAX_CLIENTS: "${HOGS_MAX_CLIENTS:-200}"
+      HOGS_MAX_PER_IP: "${HOGS_MAX_PER_IP:-16}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    pids_limit: 64
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
