@@ -10,11 +10,11 @@ A frame is:
 
 | Field | Size | |
 |---|---|---|
-| length | u16 | bytes that follow: 1 to 4096 |
+| length | u16 | bytes that follow: 1 to 16384 |
 | type | u8 | below |
 | fields | length − 1 | |
 
-Field kinds: `u8`, `u16`, `u32`; `str8` is a u8 length and that many bytes (at most 63); `blob16` is a u16 length and that many bytes (at most 256); `bytes` is everything up to the end of the frame.
+Field kinds: `u8`, `u16`, `u32`; `str8` is a u8 length and that many bytes (at most 63); `blob16` is a u16 length and that many bytes (at most 1024); `bytes` is everything up to the end of the frame.
 
 Names, descriptions, player data and messages are opaque bytes: the server stores them or passes them on and never looks inside. Text in `ERROR` and the server name are ASCII.
 
@@ -90,7 +90,7 @@ The game uses these methods of `IDirectPlay` (found in `warhogs_.exe`, the netwo
 | Open (join), CreatePlayer | JOIN |
 | EnumPlayers | the player list of JOINED, kept up to date with PLAYER_JOINED and PLAYER_LEFT |
 | GetSessionDesc, SetSessionDesc | the room fields of JOINED, SET_ROOM, ROOM_CHANGED |
-| SetPlayerData, GetPlayerData | SET_PLAYER, PLAYER_DATA |
+| SetPlayerData, GetPlayerData (the data is the player's team, 680 bytes) | SET_PLAYER, PLAYER_DATA |
 | Send (the game's messages are 348 bytes) | SEND |
 | Receive | DATA; the system messages of DirectPlay are made from PLAYER_JOINED, PLAYER_LEFT and the rest |
 | DestroyPlayer, Close | LEAVE |

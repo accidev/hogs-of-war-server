@@ -17,9 +17,9 @@ import time
 PROTOCOL = 1
 MAGIC = b'HOGS'
 PORT = 47800
-MAX_FRAME = 4096    # bytes of one frame after its length field
+MAX_FRAME = 16384   # bytes of one frame after its length field
 MAX_NAME = 63       # room name, player name
-MAX_BLOB = 256      # room description, player data
+MAX_BLOB = 1024     # room description, player data (the game keeps a team there: 680 bytes)
 MAX_PAYLOAD = 2048  # one game message
 MAX_PLAYERS = 8     # per room; the game itself has four
 HELLO_SECONDS = 10  # a new connection must send HELLO this soon

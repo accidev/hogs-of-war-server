@@ -204,18 +204,19 @@ class ServerTest(unittest.IsolatedAsyncioTestCase):
         room = await a.create()
         await b.join(room['id'])
         await a.expect(hs.PLAYER_JOINED)
-        b.send(hs.SET_PLAYER, blob16(b'team'))
+        team = bytes(range(256)) * 2 + bytes(168)  # 680 bytes: a team of the game
+        b.send(hs.SET_PLAYER, blob16(team))
         self.assertEqual((await b.expect(hs.OK)).u8(), hs.SET_PLAYER)
         f = await a.expect(hs.PLAYER_DATA)
-        self.assertEqual((f.u32(), f.blob16()), (b.id, b'team'))
-        self.assertEqual((await c.join(room['id']))['players'][1], (b.id, b'guest', b'team'))
+        self.assertEqual((f.u32(), f.blob16()), (b.id, team))
+        self.assertEqual((await c.join(room['id']))['players'][1], (b.id, b'guest', team))
 
     async def test_many_rooms(self):
         self.listener.close()
         await self.start(max_rooms=40, max_per_ip=0)
         for i in range(41):
             peer = await self.peer()
-            peer.send(hs.CREATE, bytes([4, 0]) + str8(b'r%02d' % i + b'n' * 59) + blob16(b'd' * 256) + str8(b'p' * 63))
+            peer.send(hs.CREATE, bytes([4, 0]) + str8(b'r%02d' % i + b'n' * 59) + blob16(b'd' * hs.MAX_BLOB) + str8(b'p' * 63))
             if i < 40:
                 await peer.expect(hs.JOINED)
             else:
@@ -251,7 +252,7 @@ class ServerTest(unittest.IsolatedAsyncioTestCase):
     async def test_bad_frames(self):
         for payload in (bytes([0, 0]) + str8(b'x') + blob16(b'') + str8(b'p'),        # no players allowed
                         bytes([4, 0]) + bytes([64]) + b'n' * 64 + blob16(b'') + str8(b'p'),  # name too long
-                        bytes([4, 0]) + str8(b'x') + blob16(b'd' * 257) + str8(b'p'),   # description too long
+                        bytes([4, 0]) + str8(b'x') + blob16(b'd' * (hs.MAX_BLOB + 1)) + str8(b'p'),   # description too long
                         bytes([4, 0]) + str8(b'x'),                                    # cut short
                         bytes([4, 0]) + str8(b'x') + blob16(b'') + str8(b'p') + b'!'):  # extra bytes
             peer = await self.peer()
