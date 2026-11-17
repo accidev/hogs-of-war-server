@@ -1,0 +1,50 @@
+# Every change on main: the tests, then the archive for server owners, published as the release "latest".
+name: Package
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: package
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Tests
+        run: python -m unittest -v test_server
+
+      - name: Archive
+        run: |
+          out=hogs-of-war-server
+          mkdir -p "$out/cloudflare"
+          cp hogs_server.py check.py Dockerfile compose.yaml .dockerignore README.md PROTOCOL.md LICENSE "$out/"
+          cp cloudflare/worker.js "$out/cloudflare/"
+          zip -r -X hogs-of-war-server.zip "$out"
+          unzip -l hogs-of-war-server.zip
+
+      - name: Release "latest"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git tag -f latest
+          git push -f origin latest
+          notes="Готовый сервер: распакуйте архив и в его папке выполните \`docker compose up -d --build\`, подробно в README.md. Собран из ${GITHUB_SHA::7}."
+          if gh release view latest >/dev/null 2>&1; then
+            gh release edit latest --notes "$notes"
+          else
+            gh release create latest --title "Hogs of War lobby server" --notes "$notes"
+          fi
+          gh release upload latest hogs-of-war-server.zip --clobber

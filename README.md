@@ -2,11 +2,19 @@
 
 Сервер для сетевой игры в Hogs of War через интернет. Он хранит список комнат и пересылает сообщения игры между игроками одной комнаты. Саму игру он не знает и ничего в ней не считает.
 
-**Состояние.** Сервер готов и проверен тестами. Клиентской части в игре ещё нет: её нужно добавить в [исправление](https://github.com/accidev/hogs-of-war-fix) (`ddraw.dll`), которое подменит DirectPlay. Пока её нет, к серверу подключается только `check.py`. Протокол может измениться, когда появится клиент.
+Игра подключается к нему с [исправлением Hogs of War](https://github.com/accidev/hogs-of-war-fix): адрес сервера пишется в его `hogs.ini`.
 
 ## Запуск
 
 Нужны Docker с Compose и открытый TCP-порт 47800.
+
+Готовый архив: [hogs-of-war-server.zip](https://github.com/accidev/hogs-of-war-server/releases/latest/download/hogs-of-war-server.zip). Он собирается сам при каждом изменении сервера. Распакуйте его на сервере и в его папке выполните:
+
+```
+docker compose up -d --build
+```
+
+Или через git:
 
 ```
 git clone https://github.com/accidev/hogs-of-war-server.git
@@ -29,6 +37,16 @@ docker compose exec lobby python check.py
 python check.py адрес.сервера
 ```
 
+## Подключение игроков
+
+В `hogs.ini` игры, раздел `[Network]`:
+
+```
+Server=адрес.сервера
+```
+
+Если порт не 47800: `Server=адрес.сервера:порт`. У всех игроков одной комнаты должна быть одна версия исправления.
+
 ## Настройки
 
 Настройки задаются в файле `.env` рядом с `compose.yaml`. Файла может не быть: тогда действуют значения по умолчанию.
@@ -44,6 +62,8 @@ python check.py адрес.сервера
 После правки `.env`: `docker compose up -d`.
 
 ## Обновление
+
+Из архива: скачайте новый, распакуйте поверх старой папки (файл `.env` останется) и выполните `docker compose up -d --build`. Через git:
 
 ```
 git pull
@@ -114,5 +134,8 @@ Worker передаёт серверу настоящий адрес игрок�
 | `PROTOCOL.md` | протокол между игрой и сервером |
 | `Dockerfile`, `compose.yaml` | образ и запуск |
 | `cloudflare/worker.js` | Cloudflare Worker перед сервером: скрывает его адрес и показывает список игр |
+| `.github/workflows/package.yml` | при каждом изменении в `main` прогоняет тесты и собирает архив для релиза `latest` |
 
 Без Docker сервер запускается так: `python hogs_server.py`.
+
+Лицензия MIT, см. `LICENSE`.
