@@ -328,8 +328,11 @@ class ServerTest(unittest.IsolatedAsyncioTestCase):
         text = '\n'.join(logs.output)
         for ident, cause in ((r'\d+', 'idle timeout'), (gone.id, 'the peer closed'),
                              (bad.id, 'bad frame: bad player limit')):
-            self.assertRegex(text, r'127\.0\.0\.1 #%s gone: %s; \d+ s, \d+ frames, worst delay \d\.\d\d s'
-                             % (ident, cause))
+            self.assertRegex(text, r'127\.0\.0\.1 #%s gone: %s; \d+ s, \d+ frames, worst delay \d\.\d\d s, '
+                             r'last frame \d+ s ago, \d+ bytes in, \d+ out' % (ident, cause))
+        # HELLO is 13 bytes on the wire; the quiet one sent nothing and got nothing
+        self.assertRegex(text, r'#%d gone: the peer closed; .* 1 frames, .* 13 bytes in, [1-9]\d* out' % gone.id)
+        self.assertRegex(text, r'gone: idle timeout; .* 0 frames, .* 0 bytes in, 0 out')
 
     async def test_set_room_below_the_players(self):
         a, b, c = [await self.peer() for _ in range(3)]

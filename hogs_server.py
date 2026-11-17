@@ -125,8 +125,9 @@ class Client:
         self.period = 0  # seconds between its pings, if it said so (PING)
         self.cause = None  # why the server ends the connection, when the stream alone does not say
         self.tokens = float(BURST)
-        self.stamp = self.since = time.monotonic()
+        self.stamp = self.since = self.last = time.monotonic()  # last: when its last frame came
         self.frames = 0
+        self.sent = 0  # bytes written to it
         self.worst = 0.0  # the longest a frame of this client waited for the rate limit
         self.noted = float('-inf')  # when that was last logged
         # The stream does not tell when bytes came, and a frame can lie in its buffer for seconds.
@@ -224,8 +225,11 @@ class Server:
         except OSError as why:
             cause = 'network error: %s' % why
         finally:
-            log.info('%s #%d gone: %s; %.0f s, %d frames, worst delay %.2f s', client.ip, client.id, cause,
-                     time.monotonic() - client.since, client.frames, client.worst)
+            # A link that dies on the way shows here: its last frame long ago, and how much had passed by then.
+            now = time.monotonic()
+            log.info('%s #%d gone: %s; %.0f s, %d frames, worst delay %.2f s, last frame %.0f s ago, '
+                     '%d bytes in, %d out', client.ip, client.id, cause, now - client.since, client.frames,
+                     client.worst, now - client.last, client.received, client.sent)
             self.leave(client)
             self.clients.discard(client)
             if client.counted:
@@ -258,6 +262,7 @@ class Server:
                 raise Bad('bad frame size')
             body = await asyncio.wait_for(reader.readexactly(size), self.hello_seconds)
             client.frames += 1
+            client.last = time.monotonic()
             # Too many frames are not a reason to end a game: a game that was stopped for a while
             # sends all its ticks at once. They are read no faster than RATE, and the sender waits.
             kind = body[0]
@@ -294,6 +299,7 @@ class Server:
             client.cause = 'does not read'
             transport.abort()  # its reader fails next, and serve() cleans up
             return
+        client.sent += len(data)
         client.writer.write(data)
 
     def error(self, client, request, code, text):
